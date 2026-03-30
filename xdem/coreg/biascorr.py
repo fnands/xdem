@@ -33,7 +33,7 @@ import xdem.spatialstats
 from xdem._typing import NDArrayb, NDArrayf
 from xdem.coreg.base import Coreg, InRandomDict, fit_workflows
 from xdem.cosampling import _subsample_rst_pts
-from xdem.fit import polynomial_2d
+from xdem.fit import design_matrix_polynomial_2d, polynomial_2d
 
 BiasCorrType = TypeVar("BiasCorrType", bound="BiasCorr")
 
@@ -679,6 +679,7 @@ class Deramp(BiasCorr):
             subsample,
         )
         self._meta["inputs"]["specific"]["poly_order"] = poly_order
+        self._meta["inputs"]["fitorbin"]["design_matrix_func"] = design_matrix_polynomial_2d(poly_order)
         self._needs_vars = False
 
     def _fit_rst_rst(  # type: ignore

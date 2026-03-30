@@ -86,6 +86,7 @@ dict_key_to_str = {
     "fit_func": "Function to fit",
     "fit_minimizer": "Minimizer of method",
     "fit_loss_func": "Loss function of method",
+    "design_matrix_func": "OLS design matrix builder",
     "bin_statistic": "Binning statistic",
     "bin_sizes": "Bin sizes or edges",
     "bin_apply_method": "Bin apply method",
@@ -126,7 +127,8 @@ dict_key_to_str = {
     "anisotropic": "Weights axis distances separately",
     "sampling_strategy": "Sampling strategy for point-point registration",
     "cpd_weight": "Weight of CPD outlier removal",
-    "cpd_lsg": "CPD variant LSG using normals"
+    "cpd_lsg": "CPD variant LSG using normals",
+    "cpd_estep_knearest": "Number of nearest neighbours for CPD E-step",
 }
 
 
@@ -673,6 +675,38 @@ def _postprocess_coreg_apply(
     return applied_elev, out_transform
 
 
+def _ols_fit(
+    design_matrix_func: Callable[[NDArrayf], NDArrayf],
+    xdata: NDArrayf,
+    ydata: NDArrayf,
+    sigma: NDArrayf | None,
+) -> NDArrayf:
+    """
+    Solve a linearized fitting problem with ordinary least-squares.
+
+    Builds the design matrix X = design_matrix_func(xdata), optionally applies sigma weighting,
+    and solves X @ coeffs = ydata via numpy.linalg.lstsq. If design_matrix_func has an
+    ``unnormalize_coeffs`` method (e.g. design_matrix_polynomial_2d), it is called to convert
+    coefficients back to the original coordinate space.
+
+    :param design_matrix_func: Callable that takes xdata and returns design matrix X of shape (N, P).
+    :param xdata: Input variable array passed to design_matrix_func.
+    :param ydata: Target values, shape (N,).
+    :param sigma: Per-sample standard deviations for weighting, shape (N,), or None.
+
+    :return: Coefficient array of shape (P,).
+    """
+    X = design_matrix_func(xdata)
+    if sigma is not None:
+        w = 1.0 / sigma
+        X = X * w[:, np.newaxis]
+        ydata = ydata * w
+    coeffs = np.linalg.lstsq(X, ydata, rcond=None)[0]
+    if hasattr(design_matrix_func, "unnormalize_coeffs"):
+        coeffs = design_matrix_func.unnormalize_coeffs(coeffs)
+    return coeffs
+
+
 @overload
 def _bin_or_and_fit_nd(
     fit_or_bin: Literal["fit"],
@@ -795,8 +829,13 @@ def _bin_or_and_fit_nd(
         xdata = np.array([var.flatten() for var in bias_vars.values()]).squeeze()
         ydata = values.flatten()
 
+        # If a design matrix function is provided, use direct OLS (bypasses fit_minimizer)
+        design_matrix_func = params_fit_or_bin.get("design_matrix_func")
+        if design_matrix_func is not None:
+            results = _ols_fit(design_matrix_func, xdata, ydata, sigma=kwargs.get("sigma"))
+
         # If custom fits are passed, such as "robust_norder_polynomial_fit"
-        if params_fit_or_bin["fit_minimizer"] in custom_minimizer:
+        elif params_fit_or_bin["fit_minimizer"] in custom_minimizer:
             results = params_fit_or_bin["fit_minimizer"](xdata, ydata, **kwargs)
 
         # If other minimizers are passed
@@ -869,8 +908,13 @@ def _bin_or_and_fit_nd(
         xdata = np.array([var[ind_valid].flatten() for var in new_vars]).squeeze()
         ydata = new_diff[ind_valid].flatten()
 
+        # If a design matrix function is provided, use direct OLS (bypasses fit_minimizer)
+        design_matrix_func = params_fit_or_bin.get("design_matrix_func")
+        if design_matrix_func is not None:
+            results = _ols_fit(design_matrix_func, xdata, ydata, sigma=None)
+
         # If custom fits are passed, such as "robust_norder_polynomial_fit"
-        if params_fit_or_bin["fit_minimizer"] in custom_minimizer:
+        elif params_fit_or_bin["fit_minimizer"] in custom_minimizer:
             results = params_fit_or_bin["fit_minimizer"](xdata, ydata, **kwargs)
 
         # For generic minimizer (including default)
@@ -1655,6 +1699,10 @@ class InFitOrBinDict(TypedDict, total=False):
     # For a minimization problem
     fit_minimizer: Callable[..., tuple[NDArrayf, Any]]
     fit_loss_func: Callable[[NDArrayf], np.floating[Any]]
+
+    # For a linearized OLS problem: callable that builds the design matrix X from xdata.
+    # When set, _bin_or_and_fit_nd routes to _ols_fit instead of fit_minimizer.
+    design_matrix_func: Callable[[NDArrayf], NDArrayf]
 
     # Bin parameters: bin sizes, statistic and apply method
     bin_sizes: int | dict[str, int | Iterable[float]]

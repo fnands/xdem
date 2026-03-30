@@ -615,6 +615,21 @@ def _nuth_kaab_fit_func(xx: NDArrayf, *params: tuple[float, float, float]) -> ND
     return params[0] * np.cos(params[1] - xx) + params[2]
 
 
+def _design_matrix_nuth_kaab(xdata: NDArrayf) -> NDArrayf:
+    """
+    Build the OLS design matrix for the linearized Nuth and Kääb (2011) fit.
+
+    The original model a*cos(b-x)+c is rewritten as A*cos(x) + B*sin(x) + c via the cosine
+    subtraction identity, where A=a*cos(b) and B=a*sin(b). The design matrix columns are
+    [cos(aspect), sin(aspect), 1].
+
+    :param xdata: 1D array of aspect values in radians.
+
+    :returns: Design matrix of shape (N, 3).
+    """
+    return np.column_stack([np.cos(xdata), np.sin(xdata), np.ones(len(xdata))])
+
+
 def _nuth_kaab_bin_fit(
     dh: NDArrayf,
     slope_tan: NDArrayf,
@@ -624,6 +639,10 @@ def _nuth_kaab_bin_fit(
     """
     Optimize the Nuth and Kääb (2011) function based on observed values of elevation differences, slope tangent and
     aspect at the same locations, using either fitting or binning + fitting.
+
+    Uses a linearized OLS formulation: a*cos(b-x)+c = A*cos(x) + B*sin(x) + c, where A=a*cos(b), B=a*sin(b).
+    The easting and northing offsets are recovered directly as B and A respectively, without needing to
+    back-convert through a and b.
 
     Called at each iteration step.
 
@@ -641,8 +660,8 @@ def _nuth_kaab_bin_fit(
         y = dh / slope_tan
         valids = np.isfinite(y)
         y = y[valids]
-        dh = dh[valids]
         aspect = aspect[valids]
+        slope_tan = slope_tan[valids]
 
     # Trim if required
     if "trim_residuals" in params_fit_or_bin.keys() and params_fit_or_bin["trim_residuals"]:
@@ -655,32 +674,31 @@ def _nuth_kaab_bin_fit(
         # Keep data not trimmed
         y = y[~ind]
         aspect = aspect[~ind]
-
-    # Make an initial guess of the a, b, and c parameters
-    x0 = (1, 1, float(np.nanmedian(y)))
+        slope_tan = slope_tan[~ind]
 
     # For this type of method, the procedure can only be fit, or bin + fit (binning alone does not estimate parameters)
     if params_fit_or_bin["fit_or_bin"] not in ["fit", "bin_and_fit"]:
         raise ValueError("Nuth and Kääb method only supports 'fit' or 'bin_and_fit'.")
 
-    # Define fit and bin parameters
-    params_fit_or_bin["fit_func"] = _nuth_kaab_fit_func
+    # Define fit and bin parameters; use OLS via linearized design matrix
+    params_fit_or_bin["fit_func"] = _nuth_kaab_fit_func  # kept for logging in _bin_or_and_fit_nd
     params_fit_or_bin["nd"] = 1
     params_fit_or_bin["bias_var_names"] = ["aspect"]
+    params_fit_or_bin["design_matrix_func"] = _design_matrix_nuth_kaab
 
-    # Run bin and fit, returning dataframe of binning and parameters of fitting
+    # Run bin and/or fit; _ols_fit is used internally because design_matrix_func is set.
+    # OLS results: [A=a*cos(b), B=a*sin(b), c_norm] where northing=A and easting=B.
     _, results = _bin_or_and_fit_nd(
         fit_or_bin=params_fit_or_bin["fit_or_bin"],
         params_fit_or_bin=params_fit_or_bin,
         values=y,
         bias_vars={"aspect": aspect},
-        x0=x0,
     )
     # Mypy: having results as "None" is impossible, but not understood through overloading of _bin_or_and_fit_nd...
     assert results is not None
-    easting_offset = results[0] * np.sin(results[1])
-    northing_offset = results[0] * np.cos(results[1])
-    vertical_offset = results[2] * np.nanmedian(slope_tan)
+    northing_offset = float(results[0])   # A = a * cos(b)
+    easting_offset = float(results[1])    # B = a * sin(b)
+    vertical_offset = float(results[2]) * np.nanmedian(slope_tan)
 
     return easting_offset, northing_offset, vertical_offset
 
@@ -1253,6 +1271,38 @@ def _icp_fit(
         ref = ref[:, ~ind]
         tba = tba[:, ~ind]
         norms = norms[:, ~ind]
+
+    # OLS path: when point-to-plane is linearized, the system A x = B is exact and solved directly.
+    if method == "point-to-plane" and linearized:
+        assert norms is not None
+        p = tba.T   # (N, 3)
+        q = ref.T   # (N, 3)
+        n = norms.T  # (N, 3)
+
+        A_rot = np.cross(p, n)   # (N, 3): columns for [alpha1, alpha2, alpha3]
+        A_trans = n              # (N, 3): columns for [t1, t2, t3]
+        B = np.sum(n * (q - p), axis=1)  # (N,): right-hand side
+
+        # Apply per-point weights if provided
+        n_pts = tba.shape[1]
+        w_point = _collapse_weights_to_points(weights, n_pts)
+        if w_point is not None:
+            w_sqrt = np.sqrt(w_point)
+            A_rot = A_rot * w_sqrt[:, None]
+            A_trans = A_trans * w_sqrt[:, None]
+            B = B * w_sqrt
+
+        if only_translation:
+            A = A_trans                             # (N, 3): [t1, t2, t3]
+            x_ols = np.linalg.lstsq(A, B, rcond=None)[0]
+            params_out = np.array([x_ols[0], x_ols[1], x_ols[2], 0.0, 0.0, 0.0])
+        else:
+            A = np.hstack([A_trans, A_rot])         # (N, 6): [t1, t2, t3, alpha1, alpha2, alpha3]
+            x_ols = np.linalg.lstsq(A, B, rcond=None)[0]
+            params_out = np.array([x_ols[0], x_ols[1], x_ols[2], x_ols[3], x_ols[4], x_ols[5]])
+
+        matrix = matrix_from_translations_rotations(*params_out, use_degrees=False)
+        return matrix
 
     # Group inputs into a single array
     inputs = (ref, tba, norms)
@@ -3481,8 +3531,25 @@ def _lzd_fit_linearized(
 
         if force_opti == "ols":
             logging.info("Forcing method optimization method 'ols' for LZD.")
-        results = params_fit_or_bin["fit_minimizer"](fit_func, init_offsets, loss=loss_func, **kwargs)
-        beta = results.x
+
+        # OLS: build the design matrix for the linearized LZD model directly.
+        # From _lzd_fit_func with scale=0:
+        #   dh = -gradx*t1 - grady*t2 + t3 + (y + grady*z)*alpha1 + (-x - gradx*z)*alpha2 + (gradx*y - grady*x)*alpha3
+        ones = np.ones_like(gradx)
+        if only_translation:
+            A = np.column_stack([-gradx, -grady, ones])
+            beta_ols = np.linalg.lstsq(A, dh, rcond=None)[0]
+            beta = np.array([beta_ols[0], beta_ols[1], beta_ols[2], 0.0, 0.0, 0.0])
+        else:
+            A = np.column_stack([
+                -gradx,
+                -grady,
+                ones,
+                y + grady * z,
+                -x - gradx * z,
+                gradx * y - grady * x,
+            ])
+            beta = np.linalg.lstsq(A, dh, rcond=None)[0]
         err_beta = None
     else:
         beta, err_beta, _ = _lzd_fit_error_propag(x=x, y=y, z=z, dh=dh, gx=gradx, gy=grady, pixel_size=pixel_size,
@@ -3747,7 +3814,7 @@ def lzd(
                                    transform=transform)[0]
 
     pixel_size = _res(transform)[0]
-    logging.info(f"Using {"reference" if ref_transform is not None else "to-be-aligned"} "
+    logging.info(f"Using {'reference' if ref_transform is not None else 'to-be-aligned'} "
                  f"as continuous grid for deriving gradients.")
 
     # Check that DEM CRS is projected, otherwise slope is not correctly calculated
